@@ -1,0 +1,6 @@
+# Large binary files
+extracted/
+*.bin
+*.img
+*.apk
+*.so
