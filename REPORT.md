@@ -51,6 +51,24 @@ Tailscale/NetBird VPN.
 - Remote management (OMA DM) operates over the carrier network
 - The obfuscated jiagu app runs on the dongle itself, with full system access
 
+### Additional Critical Findings from APK Decompilation
+
+The jadx decompilation of extracted APKs revealed even more severe issues:
+
+- **Hardcoded external server `154.48.236.92:7001`** (YouDo Technology cloud)
+  embedded in the management web UI — loaded for image/resource fetching
+- **IMEI modification API** (`system/setSystemImei`) — allows changing the
+  device's IMEI, enabling identity fraud
+- **103 API endpoints** exposed by the management app, including GPS tracking,
+  user management, OTA updates, push notifications, and SMS operations
+- **DES encryption** (broken, 56-bit keys) used for ALL API communication,
+  with encryption keys sent alongside the ciphertext
+- **DM.apk receives data SMS on port 16998** — remote carrier commands via SMS
+- **RIDLClient uploads every 15 minutes** to `statmando.qualcomm.com` with
+  SSL hostname verification deliberately bypassed
+- **14 dangerous Android permissions** including READ_SMS, SEND_SMS,
+  WRITE_SMS, READ_CONTACTS, ACCESS_FINE_LOCATION, READ_PHONE_STATE
+
 ### Recommendation
 
 **Replacing the stock firmware with OpenStick (Debian) eliminates all identified
