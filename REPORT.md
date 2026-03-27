@@ -1,156 +1,207 @@
-# UFI 4G USB Dongle Firmware Security Analysis
+# UFI 4G USB Dongle — Stock Firmware Security Analysis
 
 **Date:** 2026-03-27
 **Device:** Juzhen UFI 4G USB WiFi Dongle (JZ0145-v33, MSM8916)
 **Firmware:** Android 4.4.4 KTU84P, build `eng.richal.20251104`, test-keys
+**Management App:** `com.youdo.server` v1.0, Qihoo 360 jiagu-packed
 **Scope:** Authorized security research on owned hardware
-**Method:** Binary string extraction, APK decompilation, configuration analysis
-**Tools:** strings, grep, binwalk, jadx 1.5.1, dtc
+**Method:** Binary string extraction, APK extraction/decompilation, configuration analysis
+**Tools:** strings, grep, debugfs, binwalk 2.1.0, jadx 1.5.1, dtc
 
 ---
 
 ## Executive Summary
 
-The stock firmware of the UFI 4G USB dongle presents **severe security risks**
-for any deployment. The analysis identified **5 critical**, **7 high**, and
-**5 medium** severity findings across the firmware stack.
+The stock firmware presents **severe, systemic security failures** across every
+layer of the software stack. The analysis identified **8 critical**, **7 high**,
+and **5 medium** severity findings.
 
-The most significant risks are:
+The firmware is insecure both **by design** (Chinese carrier telemetry, Qualcomm
+data collection, OMA remote management) and **by negligence** (test-keys signing,
+disabled SELinux, hardcoded passwords, broken encryption, exposed debug interfaces).
 
-1. **Active phone-home to Chinese servers** — the device sends IMSI, IMEI, and
-   device identifiers to `zzhc.vnet.cn` (China Mobile) without user consent
-2. **Qihoo 360 jiagu obfuscation** — the main management app is packed with a
-   Chinese obfuscation tool that hooks into location APIs and has crash reporting
-   to `c.appjiagu.com`
-3. **Zero authentication security** — WiFi password `1234567890`, web admin
-   `admin`, SIM management `UFIadmin88888`, all hardcoded in cleartext
-4. **Qualcomm telemetry active** — RIDL (Remote Information & Data Logger)
-   collects GPS coordinates and uploads to Qualcomm; CNE sends traffic analysis
-5. **OMA Device Management** — allows the carrier to remotely manage, configure,
-   and push updates to the device without user consent
-6. **Firmware signed with public test-keys** — anyone can create system-level
-   packages that the device will accept as trusted
+**For the user's deployment scenario** (dongle connected via USB/WiFi, traffic
+routed through Tailscale/NetBird VPN), the stock firmware completely undermines
+the VPN's security guarantees. The dongle phones home over LTE independently
+of the VPN tunnel, leaking device identifiers, GPS coordinates, and traffic
+metadata to Chinese and Qualcomm servers.
 
-### Risk Assessment for VPN Use Case
+**Replacing the firmware with OpenStick Debian eliminates all identified threats.**
 
-The user's scenario: dongle connected via USB or WiFi, traffic routed through
-Tailscale/NetBird VPN.
+---
 
-| Threat | Risk with VPN | Notes |
+## Finding Summary
+
+| ID | Severity | Finding | Category |
+|----|----------|---------|----------|
+| C1 | **CRITICAL** | Hardcoded identical passwords on all devices | Credentials |
+| C2 | **CRITICAL** | Firmware signed with public AOSP test-keys | Code integrity |
+| C3 | **CRITICAL** | SELinux mandatory access control disabled | Access control |
+| C4 | **CRITICAL** | Qihoo 360 jiagu packer with location API hooks | Obfuscation |
+| C5 | **CRITICAL** | China Mobile auto-registration (zzhc) — IMSI/IMEI exfiltration | Phone-home |
+| C6 | **CRITICAL** | Hardcoded YouDo cloud server (154.48.236.92:7001) | Phone-home |
+| C7 | **CRITICAL** | IMEI modification API endpoint (identity fraud) | API abuse |
+| C8 | **CRITICAL** | DES encryption with keys sent in cleartext | Cryptography |
+| H1 | **HIGH** | Qualcomm RIDL — GPS + diagnostics uploaded every 15 min | Telemetry |
+| H2 | **HIGH** | Qualcomm CNE — traffic analysis sent to Qualcomm | Telemetry |
+| H3 | **HIGH** | OMA Device Management — remote carrier control via SMS | Remote access |
+| H4 | **HIGH** | Qualcomm DIAG + serial debug exposed on USB | Debug exposure |
+| H5 | **HIGH** | ADB enabled by default with pre-installed auth key | Remote access |
+| H6 | **HIGH** | 14 dangerous Android permissions (SMS, contacts, location) | Permissions |
+| H7 | **HIGH** | 802.11 Shared Key Auth enabled, client isolation disabled | WiFi security |
+| M1 | **MEDIUM** | Chinese carrier bloatware with silent app install | Bloatware |
+| M2 | **MEDIUM** | Crash data sent to Qihoo 360 servers | Telemetry |
+| M3 | **MEDIUM** | Google geolocation services active | Telemetry |
+| M4 | **MEDIUM** | Management frame protection (802.11w) disabled | WiFi security |
+| M5 | **MEDIUM** | CrashLogger + StatManDo system daemons | Data collection |
+
+---
+
+## Risk Assessment: VPN Use Case
+
+The user connects the dongle via USB or WiFi and routes all host traffic
+through a VPN (Tailscale/NetBird). Does the VPN protect against these threats?
+
+**No. The VPN protects host traffic but not the dongle's own traffic.**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Data flows with STOCK FIRMWARE                                  │
+│                                                                  │
+│  ┌────────┐   USB/WiFi    ┌──────────────┐   LTE    ┌────────┐ │
+│  │  Host  │──────────────→│    Dongle     │─────────→│Internet│ │
+│  │  (HA)  │               │  (And. 4.4)  │          └────────┘ │
+│  └────────┘               └──────────────┘                      │
+│       │                    │ │ │ │ │ │                           │
+│       │  VPN protects      │ │ │ │ │ └→ zzhc.vnet.cn (IMSI)    │
+│       │  THIS traffic      │ │ │ │ └──→ appjiagu.com (crashes)  │
+│       │  only ──────→      │ │ │ └────→ 154.48.236.92 (YouDo)   │
+│       │                    │ │ └──────→ Qualcomm RIDL (GPS)     │
+│       │                    │ └────────→ Qualcomm CNE (traffic)  │
+│       │                    └──────────→ OMA DM (remote ctrl)    │
+│       │                                                          │
+│       │  All dongle phone-home bypasses the VPN because it       │
+│       │  goes over LTE directly from the dongle's own apps.      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Data flows with OPENSTICK DEBIAN                                │
+│                                                                  │
+│  ┌────────┐   USB/WiFi    ┌──────────────┐   LTE    ┌────────┐ │
+│  │  Host  │──────────────→│    Dongle     │─────────→│Internet│ │
+│  │  (HA)  │               │   (Debian)   │          └────────┘ │
+│  └────────┘               └──────────────┘                      │
+│       │                    │                                     │
+│       │  VPN protects      └→ Nothing. No phone-home.            │
+│       │  ALL traffic ──→     No telemetry. No remote management. │
+│       │                      Transparent NAT gateway only.       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+| Threat | Risk with stock + VPN | Risk with Debian |
 |---|---|---|
-| Traffic interception by dongle | **HIGH** | Dongle sits BEFORE the VPN tunnel — it can see all DNS queries and connection metadata |
-| Phone-home telemetry | **HIGH** | Device identifiers (IMEI, IMSI) leaked to Chinese/Qualcomm servers on the LTE side |
-| Remote firmware update | **HIGH** | OMA DM can push updates over LTE, bypassing VPN entirely |
-| WiFi password exposure | **MEDIUM** | Default `1234567890`, any nearby device can connect |
-| Location tracking | **MEDIUM** | GPS/cell tower data collected and uploaded |
-| Malicious firmware update | **HIGH** | test-keys signing means a MITM on LTE could push malicious system updates |
-
-**The VPN does NOT protect against these risks** because:
-- Phone-home traffic goes over LTE, outside the VPN tunnel
-- The dongle operates at layer 2/3 before VPN encryption
-- Remote management (OMA DM) operates over the carrier network
-- The obfuscated jiagu app runs on the dongle itself, with full system access
-
-### Additional Critical Findings from APK Decompilation
-
-The jadx decompilation of extracted APKs revealed even more severe issues:
-
-- **Hardcoded external server `154.48.236.92:7001`** (YouDo Technology cloud)
-  embedded in the management web UI — loaded for image/resource fetching
-- **IMEI modification API** (`system/setSystemImei`) — allows changing the
-  device's IMEI, enabling identity fraud
-- **103 API endpoints** exposed by the management app, including GPS tracking,
-  user management, OTA updates, push notifications, and SMS operations
-- **DES encryption** (broken, 56-bit keys) used for ALL API communication,
-  with encryption keys sent alongside the ciphertext
-- **DM.apk receives data SMS on port 16998** — remote carrier commands via SMS
-- **RIDLClient uploads every 15 minutes** to `statmando.qualcomm.com` with
-  SSL hostname verification deliberately bypassed
-- **14 dangerous Android permissions** including READ_SMS, SEND_SMS,
-  WRITE_SMS, READ_CONTACTS, ACCESS_FINE_LOCATION, READ_PHONE_STATE
-
-### Recommendation
-
-**Replacing the stock firmware with OpenStick (Debian) eliminates all identified
-threats.** The Debian installation:
-- Removes all Chinese apps and telemetry
-- Removes Qualcomm RIDL/CNE data collection
-- Removes OMA Device Management
-- Removes the jiagu-packed management app
-- Uses mainline kernel without vendor backdoors
-- Provides full user control over all network traffic
+| Traffic interception by dongle | **HIGH** — sits before VPN, sees DNS + metadata | **NONE** — transparent NAT |
+| Phone-home telemetry | **HIGH** — IMEI/IMSI/GPS leaked over LTE | **NONE** — no telemetry apps |
+| Remote firmware update | **HIGH** — OMA DM pushes updates via carrier | **NONE** — no OMA DM |
+| WiFi password exposure | **MEDIUM** — default `1234567890` | **LOW** — user-configured |
+| Location tracking | **MEDIUM** — GPS collected and uploaded | **NONE** — no collection |
+| Malicious firmware update via MITM | **HIGH** — test-keys, anyone can sign | **NONE** — no OTA mechanism |
 
 ---
 
 ## Detailed Findings
 
-### CRITICAL Findings
+### CRITICAL
 
 #### C1: Hardcoded Default Credentials
 
-**All passwords stored in cleartext** in Android system properties:
+All passwords are hardcoded in cleartext as Android system properties, **identical
+on every device** of this model:
 
-```
-persist.sys.juzhen.ssid.pd = 1234567890    # WiFi password
+```properties
 persist.sys.juzhen.web.pd  = admin          # Web admin password
+persist.sys.juzhen.ssid.pd = 1234567890     # WiFi hotspot password
 persist.sys.juzhen.sim.pd  = UFIadmin88888  # SIM management password
 ```
 
-These are readable by any app on the device and are never rotated. The WiFi
-password `1234567890` is the same on every dongle by default.
+Additionally, the push notification system uses a hardcoded password `123456`
+(documented in the web UI: "initial password is 123456").
 
-**Impact:** Any device within WiFi range can connect. Web admin gives full
-control over APN, WiFi, and modem settings.
+**Impact:** Any device within WiFi range can connect with `1234567890`. The web
+admin panel at the dongle's IP gives full control over APN, WiFi, modem, and
+system settings with password `admin`.
 
-#### C2: Firmware Signed with Test Keys
+#### C2: Firmware Signed with Public Test Keys
 
+```properties
+ro.build.tags = test-keys    # AOSP default test keys (publicly known)
+ro.build.type = user         # Production build
 ```
-ro.build.tags = test-keys
-ro.build.type = user
-```
 
-A production (`user`) build signed with AOSP test keys. These keys are
-publicly available in the Android source code. Any attacker can:
-- Create APKs that install with system privileges
-- Push OTA updates that the device accepts as genuine
-- Replace system components
+A production (`user`) build signed with AOSP's test keys, which are published
+in the Android Open Source Project. Any attacker can:
+- Create APKs with system-level privileges
+- Push OTA updates the device will accept as genuine
+- Replace any system component
 
-**Impact:** Complete system compromise via any package install vector.
+**Impact:** Complete system compromise via any package installation vector.
 
 #### C3: SELinux Disabled
 
-```
+```properties
 ro.boot.selinux = disable
 ```
 
-SELinux (Mandatory Access Control) is explicitly disabled at boot. Combined
-with test-keys, this means there are zero access control boundaries between
-apps and the system.
+Android's mandatory access control system is explicitly turned off at boot.
+Combined with test-keys signing, there are zero security boundaries between
+applications and the system.
 
 #### C4: Qihoo 360 Jiagu Application Packer
 
-The main management app (`ufilauncherzx.apk`) is packed with **Qihoo 360's
-jiagu** (加固) obfuscation tool. Analysis of the decompiled stub reveals:
+The main management app (`ufilauncherzx.apk`, package `com.youdo.server`) is
+packed with **Qihoo 360's jiagu** (加固) commercial obfuscation tool.
 
-```java
-// StubApp.java - jiagu loader
-private static String c = "libjiagu";
-// Loads encrypted native library from hidden .jiagu directory
-System.load(str + "/" + e);
-// Dynamic class loading - real app code is encrypted
-b = (Application) classLoader.loadClass(strEntryApplication).newInstance();
+**Packer architecture:**
+```
+ufilauncherzx.apk
+├── classes.dex             ← Stub only (5 classes)
+│   ├── com.stub.StubApp    ← Entry point, loads libjiagu.so
+│   ├── com.tianyu.util.DtcLoader  ← Dynamic class loader
+│   └── com.tianyu.util.a   ← XOR string decoder, file extractor
+├── assets/
+│   ├── libjiagu.so         ← ARM32 decryptor/loader
+│   ├── libjiagu_a64.so     ← ARM64 decryptor/loader
+│   ├── libjiagu_x86.so     ← x86 decryptor/loader
+│   └── libjiagu_x64.so     ← x86_64 decryptor/loader
+├── lib/
+│   └── libjgdtc.so         ← "Data Tracking Collection" library
+└── [encrypted DEX]         ← Actual app code, decrypted at runtime only
 ```
 
-The packer includes:
-- **Native location API hooks**: `mark(LocationManager, String)` — intercepts GPS
-- **Native permission management**: hooks into Android permission system
-- **Crash reporting to Qihoo**: `http://c.appjiagu.com/apk/cr.html`
-- **String obfuscation**: XOR-encoded strings hide class/method names
+**Concerning native methods in the packer stub:**
+```java
+// Location API interception — the PACKER hooks GPS, not just the app
+public static native Location mark(LocationManager locationManager, String str);
+public static native void mark(Location location);
 
-**Why this matters:** The actual behavior of the management app is hidden behind
-military-grade obfuscation. We cannot determine what data it collects or where
-it sends it. The presence of location API hooks in the packer is particularly
-concerning.
+// Permission management hooks
+public static native void interface24(Activity, String[], int);
+
+// 50+ obfuscated native methods (n010333, n0110, n0111, etc.)
+```
+
+The packer also includes:
+- **Crash reporting** to `http://c.appjiagu.com/apk/cr.html` (Qihoo 360)
+- **Performance tracking** (`Configuration.ENABLE_PT = true`)
+- **Device fingerprinting**: collects ANDROID_ID, BRAND, MODEL, SIM operator
+- **XOR-16 string obfuscation** to hide class and method names
+
+**Why this matters:** The actual application code cannot be analyzed (encrypted
+in native libraries). Only runtime decryption (e.g., Frida) could reveal the
+real behavior. The packer's own location API hooks mean GPS interception
+happens regardless of what the wrapped app does.
 
 #### C5: China Mobile Auto-Registration (zzhc)
 
@@ -158,336 +209,341 @@ concerning.
 zzhc.vnet.cn
 ```
 
-The `zzhc` service (自主号码采集 — "autonomous number collection") automatically:
+The `zzhc` service (自主号码采集 — "autonomous number collection") is a
+China Mobile carrier requirement that:
 - Reads the SIM card's IMSI (subscriber identity)
-- Reads the device IMEI
-- Sends both to China Mobile's servers
-- Runs without any user interaction or consent
+- Reads the device IMEI (hardware identity)
+- Sends both to China Mobile's servers automatically
+- Runs without user interaction or consent
 
-This is a carrier-mandated service in China that was left active in the
-export firmware.
+This service was left active in the export firmware despite being intended
+only for the Chinese domestic market.
 
-### HIGH Findings
+#### C6: Hardcoded External Server
+
+```javascript
+// Found in the Vue.js web management UI embedded in the APK
+m["default"].prototype.$imgPath = "http://154.48.236.92:7001"
+```
+
+The IP `154.48.236.92:7001` is a **YouDo Technology** (优度科技) cloud server
+hardcoded into the management web interface. The dongle contacts this server
+for image/resource loading. This creates an external dependency that:
+- Leaks the dongle's IP address to YouDo's infrastructure
+- Could be used for tracking or command-and-control
+- Cannot be disabled without replacing the firmware
+
+#### C7: IMEI Modification API
+
+```
+API endpoint: system/setSystemImei
+```
+
+The management app exposes an API endpoint that allows **changing the device's
+IMEI** (International Mobile Equipment Identity). IMEI modification is:
+- **Illegal** in most jurisdictions (EU, US, UK, Australia)
+- Used for **identity fraud**, stolen device laundering, and tracking evasion
+- A serious liability for anyone deploying these dongles
+
+This is one of **103 API endpoints** discovered in the management web interface.
+Other notable endpoints include:
+- `gpsRecord/gpsRecordWithPage` — GPS location history with pagination
+- `system/addApn` — add custom APN (can redirect all data traffic)
+- `formalPackage/selectUpdateFile2Client` — push firmware updates
+- `notice/sendNotify` — push notifications to devices
+- `userInfo/batchAddUserInfo` — batch user management (fleet management)
+
+#### C8: Broken Encryption
+
+All API communication uses **DES encryption** (a 56-bit cipher broken since
+1998) with a critically flawed key exchange:
+
+```javascript
+// The "secret" key is derived from a Snowflake ID
+// BOTH the full ID AND the character positions are sent in cleartext
+return {
+    data: DES_encrypt(plaintext, secretkey),    // DES-encrypted data
+    pulickKey: snowflakeId + "$" + positions    // Key reconstruction info!
+}
+```
+
+Anyone intercepting the HTTP traffic (no TLS) can:
+1. Read the `pulickKey` field
+2. Extract the Snowflake ID and position array
+3. Reconstruct the 6-character DES key
+4. Decrypt all communication
+
+**Impact:** All management API traffic is effectively plaintext.
+
+---
+
+### HIGH
 
 #### H1: Qualcomm RIDL — Remote Information & Data Logger
 
-**`RIDLClient.apk`** is a Qualcomm system app that:
-- Collects GPS coordinates (latitude, longitude, altitude)
-- Collects network type and signal quality
-- Collects device diagnostics
-- Compresses and uploads data to Qualcomm servers
+**App:** `RIDLClient.apk` (com.qualcomm.RIDL, v4.3.12)
 
-Found database schema references to location tracking tables with
-latitude/longitude fields.
+Qualcomm's RIDL system collects and uploads device data:
+- **GPS coordinates** (latitude, longitude, altitude — confirmed via database schema)
+- Network type and signal quality
+- Bluetooth device information
+- Call and device diagnostics
+- **Uploads every 15 minutes** to `https://statmando.qualcomm.com/RIDL.php`
+
+The SSL implementation **bypasses hostname verification**:
+```java
+httpCon.setHostnameVerifier(new HostnameVerifier() {
+    public boolean verify(String hostname, SSLSession session) {
+        return "statmando.qualcomm.com".equalsIgnoreCase(hostname);
+        // Only checks hostname string, NOT the certificate chain
+    }
+});
+```
+
+This makes the upload vulnerable to MITM attacks with any certificate
+that presents the correct hostname.
+
+**Permissions:** INTERNET, READ_LOGS, ACCESS_FINE_LOCATION,
+PROCESS_OUTGOING_CALLS, BLUETOOTH, BLUETOOTH_ADMIN, REBOOT
 
 #### H2: Qualcomm CNE — Connectivity Engine
 
 Sends traffic analysis and WiFi environment data to `cne.qualcomm.com`.
-Evaluates network quality by analyzing actual traffic patterns.
+Continuously evaluates network quality by analyzing actual traffic patterns,
+WiFi access point characteristics, and connection metadata.
 
-#### H3: OMA Device Management (DM.apk)
+#### H3: OMA Device Management
 
-OMA DM allows the carrier to:
-- Push configuration changes remotely
-- Install or update apps
-- Modify APN and network settings
-- Execute device management commands
+**App:** `DM.apk` (com.android.dm)
 
-This operates over the carrier's control channel, completely bypassing any
-VPN or firewall on the device.
+A full OMA-DM client that allows the carrier to remotely manage the device:
+- **Receives commands via data SMS on port 16998**
+- Receives OMA-DM WAP push messages
+- Can modify APN settings (redirect all traffic)
+- Can modify system settings and browser bookmarks
+- Has a secret dialer code `*#*#3636#*#*` for debug access
+- Auto-starts on boot via `DmReceiver`
+- Uses native JNI for the OMA-DM protocol (`DMNativeMethod`)
+
+**Permissions:** RECEIVE_SMS, SEND_SMS, RECEIVE_WAP_PUSH, WRITE_APN_SETTINGS,
+ACCESS_FINE_LOCATION, READ_HISTORY_BOOKMARKS, CONNECTIVITY_INTERNAL
+
+**Impact:** The carrier (or anyone who can send data SMS to port 16998) can
+remotely control the device, completely bypassing any VPN or firewall.
 
 #### H4: Qualcomm Diagnostic Interface Exposed
 
-```
+```properties
 persist.sys.usb.config = diag,serial_smd,rmnet_bam,adb
 ```
 
-The Qualcomm DIAG interface is enabled by default on USB, allowing:
-- Reading/writing modem NV items (including IMEI)
-- Raw AT command access
-- Over-the-air radio traffic capture
-- Modem firmware parameter modification
+The default USB configuration exposes:
+- **DIAG** — Qualcomm diagnostic interface (read/write modem NV items, IMEI,
+  raw AT commands, over-the-air radio capture)
+- **serial_smd** — serial debug access to modem subsystem
+- **ADB** — Android Debug Bridge (full shell access)
 
-#### H5: ADB Enabled by Default
+#### H5: ADB with Pre-installed Auth Key
 
-ADB is part of the default USB configuration. Anyone with USB access has
-full shell access to the device.
+ADB is enabled by default, and a pre-installed public key (`/etc/adbkey.pub`,
+owner `unknown@unknown`) is embedded in the system partition. Whoever holds
+the corresponding private key has permanent, passwordless shell access.
 
-#### H6: 802.11 Shared Key Authentication Enabled
+#### H6: Dangerous Android Permissions
+
+The management app requests **14 dangerous permissions** out of 21 total:
+
+| Permission | Capability |
+|---|---|
+| READ_SMS, WRITE_SMS, SEND_SMS | Read, modify, and send text messages |
+| READ_CONTACTS, WRITE_CONTACTS | Read and modify contact list |
+| READ_CALL_LOG, WRITE_CALL_LOG | Read and modify call history |
+| ACCESS_FINE_LOCATION | Precise GPS location |
+| READ_PHONE_STATE | Read IMEI, phone number, SIM info |
+| MODIFY_PHONE_STATE | Modify telephony state |
+| WRITE_APN_SETTINGS | Modify APN (redirect all data traffic) |
+| WRITE_SETTINGS | Modify system settings |
+| RECEIVE_BOOT_COMPLETED | Auto-start on boot |
+| KILL_BACKGROUND_PROCESSES | Kill other applications |
+
+Both background services (`UfiServer`, `HttpService`) are declared as
+`exported="true"`, meaning any app on the device can interact with them.
+
+#### H7: WiFi Security Weaknesses
 
 ```
-auth_algs=3   # Both Open System (1) and Shared Key (2)
+auth_algs=3              # Enables legacy Shared Key Authentication
+# ap_isolate not set     # Clients can communicate with each other
+# ieee80211w not set     # Management frame protection disabled
 ```
 
-Shared Key Authentication is a legacy WEP-era mechanism with known
-cryptographic weaknesses. It should never be enabled alongside WPA2.
+- **Shared Key Authentication** (WEP-era, cryptographic weaknesses)
+  enabled alongside WPA2
+- **Client isolation disabled** — connected devices can scan and attack
+  each other
+- **802.11w disabled** — deauthentication attacks possible
 
-#### H7: WiFi Client Isolation Disabled
+---
 
-```
-# ap_isolate not set (defaults to 0)
-```
-
-Connected WiFi clients can communicate with each other and scan the
-local network. In a hotspot scenario, this allows one connected device
-to attack others.
-
-### MEDIUM Findings
+### MEDIUM
 
 #### M1: Chinese Carrier Bloatware
 
-Pre-installed apps for all three Chinese carriers:
-- `10086cn.apk` — China Mobile portal
-- `CmccServer.apk`, `CmccWifi.apk`, `CmccCustom.apk` — China Mobile services
-- `CarrierLoadService.apk` — carrier app auto-download service
-- `Monternet.apk` — China Mobile mobile internet portal
+Pre-installed apps for all three Chinese carriers (15 APKs from China Mobile
+alone), including:
+- `CarrierLoadService.apk` — **silent app download and installation**
+- `CmccServer.apk` — China Mobile service with CALL_PHONE and SEND_SMS
+- `AutoRegistration.apk` — auto-registers device with carrier on boot
+- `10086cn.apk`, `CmccWifi.apk`, `CmccCustom.apk` — China Mobile portals
 
-These apps have capabilities for:
-- Auto-registration with carrier
-- Silent app downloads (`CarrierLoadService`)
-- Background data collection
-
-#### M2: Google Geolocation Services Active
-
-WiFi access point and cell tower data is sent to Google for geolocation.
-While less concerning than the Chinese telemetry, this is still data
-collection without explicit user consent on a USB dongle.
-
-#### M3: WPS Disabled but WPS PIN Present
-
-```
-wps_state=0            # WPS disabled (good)
-device_name=QualcommAtheros  # But WPS device name configured
-```
-
-WPS is disabled, but the configuration suggests it was available and
-may be re-enabled by firmware updates.
-
-#### M4: Management Frame Protection Disabled
-
-```
-# ieee80211w not set (defaults to disabled)
-```
-
-802.11w (Protected Management Frames) is not enabled. This allows
-deauthentication attacks against connected WiFi clients.
-
-#### M5: CrashLogger and Statistics Collection
-
-```
-CrashLogger.apk
-StatManDo.apk
-MediaUploader.apk
-```
-
-System-level daemons that collect crash reports, usage statistics,
-and media metadata. Data destination is unclear due to jiagu obfuscation.
-
----
-
-## System App Inventory
-
-APKs extracted from the system partition:
-
-| APK | Purpose | Risk |
-|---|---|---|
-| **ufilauncherzx.apk** | Main management app (jiagu-packed) | CRITICAL — obfuscated, unknown behavior |
-| **RIDLClient.apk** | Qualcomm data collection | HIGH — GPS + diagnostics upload |
-| **DM.apk** | OMA Device Management | HIGH — remote carrier control |
-| **10086cn.apk** | China Mobile portal | MEDIUM — carrier telemetry |
-| **CmccServer.apk** | China Mobile services | MEDIUM — auto-registration |
-| **CmccWifi.apk** | China Mobile WiFi | MEDIUM — WiFi data collection |
-| **CmccCustom.apk** | China Mobile customization | MEDIUM |
-| **CarrierLoadService.apk** | Silent app download | MEDIUM — can install apps |
-| **CarrierConfigure.apk** | Carrier configuration | MEDIUM |
-| **DataMonitor.apk** | Data usage monitoring | LOW |
-| **DeviceInfo.apk** | Device information | LOW |
-| **Firewall.apk** | Network firewall | LOW |
-| **NetworkSetting.apk** | Network settings UI | LOW |
-| **AreaSearch.apk** | Location/area search | LOW |
-| **ModemTestMode.apk** | Modem diagnostics | LOW |
-| **xtra_t_app.apk** | GPS assistance (XTRA) | LOW |
-| **CrashLogger.apk** | Crash reporting | MEDIUM |
-| **StatManDo.apk** | Statistics collection | MEDIUM |
-| **MediaUploader.apk** | Media upload service | MEDIUM |
-
-Additionally, the system partition contains Google apps (Chrome, Gmail,
-Play Services, etc.) which add their own telemetry but are standard
-Android components.
-
----
-
-## Jiagu Packer Technical Analysis
-
-The `ufilauncherzx.apk` management app uses Qihoo 360's jiagu (加固)
-application protection. Decompilation with jadx 1.5.1 reveals only 5
-stub files — the actual application code is encrypted inside native
-libraries.
-
-### Packer Architecture
-
-```
-ufilauncherzx.apk
-├── classes.dex           ← Stub only (5 classes)
-│   ├── com.stub.StubApp  ← Application entry, loads libjiagu.so
-│   ├── com.tianyu.util.DtcLoader  ← Dynamic class loader
-│   ├── com.tianyu.util.a  ← Utility (string decode, file extract)
-│   ├── com.tianyu.util.Configuration  ← Config
-│   └── com.youdo.server.R  ← Resources
-├── assets/
-│   ├── libjiagu.so       ← ARM 32-bit decryptor
-│   ├── libjiagu_a64.so   ← ARM 64-bit decryptor
-│   ├── libjiagu_x86.so   ← x86 decryptor
-│   └── libjiagu_x64.so   ← x86_64 decryptor
-└── [encrypted DEX]       ← Real app code, decrypted at runtime
-```
-
-### Runtime Behavior
-
-1. Android loads `StubApp` as the Application class
-2. `StubApp.attachBaseContext()` extracts `libjiagu.so` to a hidden
-   `.jiagu` directory in the app's data folder
-3. The native library is loaded via `System.load()`
-4. Native code decrypts the real DEX bytecode in memory
-5. `DtcLoader` dynamically loads the decrypted classes
-6. The real Application class (`entryRunApplication`) is instantiated
-7. All subsequent calls are proxied through native methods
-
-### Concerning Native Methods
-
-```java
-// Location API interception
-public static native Location mark(LocationManager locationManager, String str);
-public static native void mark(Location location);
-
-// Permission management hooks
-public static native void interface24(Activity, String[], int);
-
-// Dozens of obfuscated native methods (n010333, n0110, n0111, etc.)
-// Purpose unknown — could be anything from data collection to remote access
-```
-
-The presence of `LocationManager` hooks in the **packer itself** (not the app)
-means the jiagu framework has built-in capability to intercept and potentially
-exfiltrate location data, regardless of what the wrapped app does.
-
-### Crash Reporting Phone-Home
+#### M2: Crash Reporting to Qihoo 360
 
 ```
 http://c.appjiagu.com/apk/cr.html
 qihoo_jiagu_crash_report.xml
 ```
 
-Crash reports are sent to Qihoo 360's servers, including device identifiers
-and potentially app state information.
+Crash reports sent unencrypted to Qihoo 360's servers, including device
+identifiers, app state, and stack traces.
+
+#### M3: Google Geolocation Services
+
+WiFi access point and cell tower data sent to Google for geolocation.
+Standard Android behavior but undisclosed on a USB dongle.
+
+#### M4: Management Frame Protection Disabled
+
+802.11w (Protected Management Frames) not enabled. Allows deauthentication
+attacks against connected WiFi clients.
+
+#### M5: Statistics Collection Daemons
+
+```
+CrashLogger.apk    — system-level crash collection
+StatManDo.apk      — usage statistics daemon
+MediaUploader.apk  — media metadata upload service
+```
+
+System daemons that collect and potentially upload device usage data.
+Exact data destinations unclear due to jiagu obfuscation of the main app.
 
 ---
 
-## Network Threat Model
+## System App Inventory
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Data flows with stock firmware                              │
-│                                                              │
-│  ┌────────┐   USB/WiFi    ┌──────────┐   LTE    ┌────────┐ │
-│  │  Host  │──────────────→│  Dongle  │─────────→│Internet│ │
-│  │  (HA)  │               │ (And4.4) │          └────────┘ │
-│  └────────┘               └──────────┘                      │
-│       │                    │ │ │ │ │                         │
-│       │                    │ │ │ │ └→ zzhc.vnet.cn (IMSI)   │
-│       │                    │ │ │ └──→ appjiagu.com (crash)   │
-│       │                    │ │ └────→ Qualcomm RIDL (GPS)    │
-│       │                    │ └──────→ Qualcomm CNE (traffic) │
-│       │                    └────────→ OMA DM (remote ctrl)   │
-│       │                                                      │
-│       └── VPN tunnel only protects THIS traffic ──→          │
-│           (dongle phone-home bypasses VPN)                    │
-└─────────────────────────────────────────────────────────────┘
-```
+19 APKs extracted from the system partition. Key apps by risk:
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Data flows with OpenStick (Debian)                          │
-│                                                              │
-│  ┌────────┐   USB/WiFi    ┌──────────┐   LTE    ┌────────┐ │
-│  │  Host  │──────────────→│  Dongle  │─────────→│Internet│ │
-│  │  (HA)  │               │ (Debian) │          └────────┘ │
-│  └────────┘               └──────────┘                      │
-│       │                    │                                 │
-│       │                    └→ (nothing — no phone-home)      │
-│       │                                                      │
-│       └── VPN tunnel protects ALL traffic ──→                │
-│           (dongle is a transparent NAT gateway)              │
-└─────────────────────────────────────────────────────────────┘
-```
+| APK | Package | Risk | Capabilities |
+|---|---|---|---|
+| **ufilauncherzx.apk** | com.youdo.server | CRITICAL | Jiagu-packed, 103 API endpoints, YouDo cloud, IMEI mod, GPS tracking |
+| **RIDLClient.apk** | com.qualcomm.RIDL | HIGH | GPS + diagnostics → Qualcomm every 15 min, SSL bypass |
+| **DM.apk** | com.android.dm | HIGH | OMA-DM, SMS port 16998, remote APN/settings control |
+| **CmccServer.apk** | com.android.cmcc | MEDIUM | CALL_PHONE, SEND_SMS without user consent |
+| **CarrierLoadService.apk** | — | MEDIUM | Silent app download and installation |
+| **AutoRegistration.apk** | — | MEDIUM | Auto-register device with carrier on boot |
+| **CrashLogger.apk** | — | MEDIUM | System crash collection |
+| **StatManDo.apk** | — | MEDIUM | Usage statistics |
+| **DataMonitor.apk** | — | LOW | Data usage monitoring |
+| **NetworkSetting.apk** | — | LOW | Network settings UI |
+| **ModemTestMode.apk** | — | LOW | Modem diagnostics |
+
+---
+
+## Build Identity
+
+| Property | Value |
+|---|---|
+| Build fingerprint | `qcom/msm8916_32_512/msm8916_32_512:4.4.4/KTU84P/eng.richal.20251104:user/test-keys` |
+| Build engineer | `richal` |
+| Source path | `/home/richal/code3/jz0116/Android/kernel/` |
+| Build host | `server` |
+| Build date | 2025-11-04 |
+| Board | JZ0116 → JZ0145 v33 variant |
+| Product | UFI branded (`ro.product.model=UFI`) |
+
+The build path (`jz0116`) and engineer username (`richal`) indicate a
+small-scale operation at Juzhen (矩阵) Technology.
 
 ---
 
 ## Methodology
 
-### Tools Used
+### Tools
 
 | Tool | Version | Purpose |
 |---|---|---|
-| `strings` | GNU coreutils | Extract printable text from binary partition images |
-| `grep` | GNU grep | Pattern matching for URLs, credentials, services |
-| `binwalk` | 2.1.0 | Scan for embedded files and extract APKs |
-| `jadx` | 1.5.1 | Decompile Android APKs to Java source |
-| `dtc` | (system) | Device tree compiler for DTB analysis |
-| `file` | (system) | File type identification |
+| `strings` | GNU coreutils | Extract printable text from 3.4 GB of partition images |
+| `grep` | GNU grep | Pattern matching (URLs, credentials, services, phone-home indicators) |
+| `debugfs` | e2fsprogs | Read ext4 partition images without mounting (no root needed) |
+| `binwalk` | 2.1.0 | Scan for and extract embedded files from raw images |
+| `jadx` | 1.5.1 | Decompile Android APK/DEX to Java source code |
+| `file` | GNU | File type identification |
+| `dtc` | system | Device tree compiler/decompiler |
 
-### Analysis Process
+### Process
 
-1. **Property analysis**: Parsed `getprop.txt` (278 properties) for
-   credentials, debug flags, vendor-specific settings
-2. **WiFi configuration**: Analyzed `hostapd.conf` (1045 lines) for
-   security weaknesses
-3. **Binary string extraction**: Ran `strings` on system.bin (800 MB)
-   and userdata.bin (2.6 GB), filtered for URLs, IPs, domains, credentials
-4. **APK extraction**: Used `binwalk` to extract APKs from the raw
-   system partition image
-5. **APK decompilation**: Decompiled `ufilauncherzx.apk` with `jadx`,
-   analyzed the jiagu packer stub code
-6. **Service analysis**: Searched for init scripts, daemon definitions,
-   listening ports, remote access mechanisms
+1. **System properties** — parsed `getprop.txt` (278 properties) for credentials,
+   debug flags, vendor configuration, carrier settings
+2. **WiFi configuration** — analyzed `hostapd.conf` (1045 lines) for authentication
+   weaknesses, WPS state, management frame protection
+3. **Binary string extraction** — ran `strings` on system.bin (800 MB) and
+   userdata.bin (2.6 GB), extracted 4.5M+ strings, filtered for URLs (1,014 unique),
+   IP addresses (760), Chinese domains (278), credential patterns (522),
+   certificate references (374)
+4. **APK extraction** — used `debugfs` to extract 48 APKs from the ext4 system
+   partition image without root access
+5. **APK decompilation** — decompiled 4 key APKs with jadx (ufilauncherzx,
+   RIDLClient, DM, CmccServer), analyzed Java source for network connections,
+   data collection, API endpoints, permissions
+6. **Jiagu packer analysis** — analyzed the 5 stub classes visible through the
+   Qihoo 360 jiagu obfuscation, identified native method signatures including
+   location API hooks
+7. **Service analysis** — searched for init scripts, daemon definitions, listening
+   ports, remote access mechanisms, SMS interception
 
 ### Limitations
 
-- **Jiagu encryption**: The main app's actual code could not be analyzed
-  due to native-code encryption. A full analysis would require runtime
-  decryption (e.g., Frida hooking on a running device)
-- **No mount access**: Partition images were analyzed via binary string
-  extraction, not mounted filesystems. Some filesystem metadata was not
-  available
-- **Modem firmware**: The Qualcomm modem firmware (MPSS) is a proprietary
-  binary blob that was not analyzed. Modem-level backdoors cannot be ruled out
+- **Jiagu encryption** — the main app's actual code is encrypted in native
+  libraries (`libjiagu.so`). Full analysis requires runtime decryption
+  (e.g., Frida instrumentation on a running device)
+- **No filesystem mount** — partition images analyzed via binary string extraction
+  and `debugfs`, not mounted. Some metadata not accessible
+- **Modem firmware** — the Qualcomm MPSS modem firmware is a proprietary binary
+  blob not analyzed. Modem-level backdoors cannot be ruled out
+- **Network traffic** — no live traffic capture was performed. Phone-home
+  behavior inferred from code analysis, not observed network connections
 
 ---
 
 ## Conclusion
 
-The stock firmware is fundamentally insecure by design and by accident:
+The stock firmware is **compromised by default** through a combination of:
 
-- **By design**: Chinese carrier requirements (zzhc auto-registration,
-  OMA DM remote management) and Qualcomm telemetry (RIDL, CNE) are
-  intentional data collection mechanisms
-- **By accident**: test-keys signing, disabled SELinux, hardcoded passwords,
-  and exposed debug interfaces are negligence by the manufacturer (Juzhen)
+1. **Manufacturer negligence** — test-keys signing, SELinux disabled, hardcoded
+   passwords, broken DES encryption, IMEI modification endpoint, debug
+   interfaces exposed
+2. **Intentional Chinese carrier requirements** — zzhc IMSI collection, OMA-DM
+   remote management, auto-registration, carrier bloatware with call/SMS
+   permissions
+3. **Qualcomm telemetry** — RIDL GPS tracking (15-min uploads), CNE traffic
+   analysis, with deliberately weakened SSL verification
+4. **Third-party obfuscation** — Qihoo 360 jiagu packer hides app behavior,
+   includes its own location API hooks and crash reporting to Chinese servers
 
-For any security-conscious deployment, the stock firmware should be
-considered **compromised by default**. The replacement with OpenStick
-Debian eliminates all identified software-level threats while retaining
-the hardware's functionality.
+For any security-conscious deployment, the stock firmware should be replaced
+immediately. The OpenStick Debian installation eliminates all identified
+software-level threats while retaining full hardware functionality (LTE modem,
+WiFi, USB networking).
 
-The only remaining proprietary components after the OpenStick flash are
-the Qualcomm coprocessor firmwares (modem, WiFi, TZ, RPM), which operate
-below the OS level and are standard across all MSM8916 devices.
+The only remaining proprietary components after flashing Debian are the
+Qualcomm coprocessor firmwares (modem, WiFi, TrustZone, RPM), which are
+standard across all MSM8916 devices and operate below the OS level.
 
 ---
 
-## Detailed Findings Files
+## Appendix: Detailed Findings
 
-- [01-properties-and-wifi.md](findings/01-properties-and-wifi.md) — System properties and WiFi configuration
-- [02-urls-and-credentials.md](findings/02-urls-and-credentials.md) — URLs, domains, IPs, and hardcoded credentials
-- [03-services-and-backdoors.md](findings/03-services-and-backdoors.md) — Services, daemons, and backdoor assessment
-- [04-apk-analysis.md](findings/04-apk-analysis.md) — APK extraction and decompilation (when available)
+- [01 — System Properties and WiFi Configuration](findings/01-properties-and-wifi.md) (342 lines)
+- [02 — URLs, Domains, IPs, and Credentials](findings/02-urls-and-credentials.md) (679 lines)
+- [03 — Services, Daemons, and Backdoor Assessment](findings/03-services-and-backdoors.md) (372 lines)
+- [04 — APK Extraction and Decompilation](findings/04-apk-analysis.md) (478 lines)
